@@ -38,8 +38,6 @@ import org.elasticsearch.common.collect.Maps;
 import org.elasticsearch.common.inject.Inject;
 import org.elasticsearch.common.unit.TimeValue;
 import org.elasticsearch.common.util.concurrent.EsExecutors;
-import org.elasticsearch.common.util.concurrent.jsr166y.LinkedTransferQueue;
-import org.elasticsearch.common.util.concurrent.jsr166y.TransferQueue;
 import org.elasticsearch.common.xcontent.XContentBuilder;
 import org.elasticsearch.common.xcontent.XContentFactory;
 import org.elasticsearch.common.xcontent.XContentType;
@@ -62,6 +60,8 @@ import java.util.*;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TransferQueue;
+import java.util.concurrent.LinkedTransferQueue;
 
 import static org.elasticsearch.common.xcontent.XContentFactory.jsonBuilder;
 
@@ -294,7 +294,16 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
 
     private List<Object> getViewRows(String id)
     {
-      String file = new StringBuilder().append("/").append(this.couchDb).append("/_design/").append(this.couchView).append("?key=%22").append(id).append("%22").toString();
+      String encodedId = null;
+      try {
+          XContentBuilder builder = jsonBuilder();
+          builder.value(id);
+          encodedId = URLEncoder.encode(builder.string(), "UTF-8");
+      } catch (IOException e) {
+          this.logger.warn("failed to build view key json {}", e);
+      }
+
+      String file = new StringBuilder().append("/").append(this.couchDb).append("/_design/").append(this.couchView).append("?key=").append(encodedId).toString();
       String view = fetchURL(file);
 
       Map<String, Object> ctx = null;
@@ -307,43 +316,47 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
       return getListFromJsonNode(ctx, "rows");
     }
 
-    private void doDeleteFromView(List<Object> rows, String index, String type, String id, String routing, BulkRequestBuilder bulk)
+    private void doDeleteFromView(List<Object> rows, String index, String type, String id, String routing, BulkProcessor bulk)
     {
-
       if (!this.couchViewIgnoreRemove)
       {
-        long oldSize = 0L;
-        try
-        {
-            PrefixQueryBuilder pqb = QueryBuilders.prefixQuery(
-                new StringBuilder().append(type).append("._id").toString(),
-                new StringBuilder().append(id).append("_").toString());
+        bulk.add(Requests.deleteRequest(index).type(type).id(id).routing(routing));
+        // long oldSize = 0L;
+        // try
+        // {
+        //     PrefixQueryBuilder pqb = QueryBuilders.prefixQuery(
+        //         new StringBuilder().append(type).append("._id").toString(),
+        //         new StringBuilder().append(id).append("_").toString());
 
-          CountRequestBuilder count = this.client.prepareCount(new String[] { index }).setQuery(pqb);
-          CountResponse response = count.execute().actionGet();
-          oldSize = response.getCount();
-        } catch (Exception e) {
-          this.logger.warn("failed to execute count", e, new Object[0]);
-        }
+        //   CountRequestBuilder count = this.client.prepareCount(new String[] { index }).setQuery(pqb);
+        //   CountResponse response = count.execute().actionGet();
+        //   oldSize = response.getCount();
+        // } catch (Exception e) {
+        //   this.logger.warn("failed to execute count", e, new Object[0]);
+        // }
 
-        if (rows.size() < oldSize) {
-          for (int i = rows.size() + 1; i < oldSize + 1L; i++) {
-            bulk.add(Requests.deleteRequest(index).type(type).id(new StringBuilder().append(id).append("_").append(i).toString()).routing(routing));
-          }
-        }
+        // if (rows.size() < oldSize) {
+        //   for (int i = rows.size() + 1; i < oldSize + 1L; i++) {
+        //     bulk.add(Requests.deleteRequest(index).type(type).id(new StringBuilder().append(id).append("_").append(i).toString()).routing(routing));
+        //   }
+        // }
       }
     }
 
-    private void deletingFromView(String index, String type, String id, String routing, BulkRequestBuilder bulk)
+    private void deletingFromView(String index, String type, String id, String routing, BulkProcessor bulk)
     {
       doDeleteFromView(getViewRows(id), index, type, id, routing, bulk);
     }
 
-    private void processingView(String index, String type, String id, String routing, String parent, BulkRequestBuilder bulk)
+    private void processingView(String index, String type, String id, String routing, String parent, BulkProcessor bulk)
     {
+      if (this.logger.isTraceEnabled()) {
+          this.logger.trace("processing view [index ]: [{}]/[{}]/[{}], view {}", index, type, id, this.couchView);
+      }
+
       List<Object> rows = getViewRows(id);
 
-      doDeleteFromView(rows, index, type, id, routing, bulk);
+      //doDeleteFromView(rows, index, type, id, routing, bulk);
 
       int rownum = 1;
       for (Iterator<Object> it = rows.iterator(); it.hasNext(); ) { 
@@ -368,13 +381,13 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
 					    }
 					}
 
+					String indexId = id;//new StringBuilder().append(id).append("_").append(rownum++).toString();
 					bulk.add(Requests
-							.indexRequest(index)
-							.type(type)
-							.id(new StringBuilder().append(id).append("_")
-									.append(rownum++).toString()).source(value)
-							.routing(routing)
-							.parent(parent));
+						.indexRequest(index)
+						.type(type)
+						.id(indexId).source(value)
+						.routing(routing)
+						.parent(parent));
 				}
 			}
 		}
@@ -413,6 +426,11 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
             logger.warn("received error {}", s);
             return null;
         }
+        if (!ctx.containsKey("seq") || !ctx.containsKey("id")) {
+            logger.trace("ignoring line without seq/id {}", s);
+            return null;
+        }
+
         Object seq = ctx.get("seq");
         String id = ctx.get("id").toString();
 
@@ -436,8 +454,6 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
             }
         }
 
-        id = (ctx.get("id") == null) ? null : ctx.get("id").toString();
-
         if (ctx.containsKey("ignore") && ctx.get("ignore").equals(Boolean.TRUE)) {
             // ignore dock
         } else if (ctx.containsKey("deleted") && ctx.get("deleted").equals(Boolean.TRUE)) {
@@ -447,9 +463,9 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
                 logger.trace("processing [delete]: [{}]/[{}]/[{}]", index, type, id);
             }
             if (this.couchView == null) {
-                bulk.add(deleteRequest(index).type(type).id(id).routing(extractRouting(ctx)).parent(extractParent(ctx)));
+                bulkProcessor.add(Requests.deleteRequest(index).type(type).id(id).routing(extractRouting(ctx)).parent(extractParent(ctx)));
             } else {
-                deletingFromView(index, type, id, extractRouting(ctx), bulk);
+                deletingFromView(index, type, id, extractRouting(ctx), bulkProcessor);
             }
 		} else {
 			String index = extractIndex(ctx);
@@ -476,20 +492,24 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
 								index, type, id, doc);
 					}
 
-					bulk.add(indexRequest(index).type(type).id(id).source(doc)
+					bulkProcessor.add(Requests.indexRequest(index).type(type).id(id).source(doc)
 							.routing(extractRouting(ctx))
 							.parent(extractParent(ctx)));
 				} else {
 					logger.warn("ignoring unknown change {}", s);
 				}
-			} else {
-				if (this.logger.isTraceEnabled()) {
-					this.logger.trace("processing view [index ]: [{}]/[{}]/[{}], view {}", index, type, id,	this.couchView);
-				}
+		} else {
+			if (this.couchView != null && ctx.containsKey("viewKeys")) {
+				List<String> viewKeys = (List<String>) ctx.get("viewKeys");
 
-				processingView(index, type, id, extractRouting(ctx), extractParent(ctx), bulk);
+				for (String key : viewKeys) {
+					processingView(index, type, key, extractRouting(ctx), extractParent(ctx), bulkProcessor);
+				}
+			} else {
+				processingView(index, type, id, extractRouting(ctx), extractParent(ctx), bulkProcessor);
 			}
 		}
+	}
 
         return seq;
     }
@@ -523,7 +543,7 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
       return fetchURL(file, null);
     }
 
-	private String fetchURL(String file, TransferQueue<String> tqueue) {
+	private String fetchURL(String file, LinkedTransferQueue<String> tqueue) {
 		StringBuffer sbf = new StringBuffer();
 
 		if (this.logger.isDebugEnabled()) {
@@ -567,7 +587,10 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
 				sbf.append(line);
 			}
 		} catch (Exception e) {
-			Closeables.closeQuietly(is);
+			try {
+				is.close();
+			} catch (IOException ex) {
+			}
 			if (connection != null) {
 				try {
 					connection.disconnect();
@@ -586,11 +609,17 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
 				Thread.sleep(5000L);
 			} catch (InterruptedException e1) {
 				if (this.closed) {
-					Closeables.closeQuietly(is);
+					try {
+						is.close();
+					} catch (IOException ex) {
+					}
 				}
 			}
 		} finally {
-			Closeables.closeQuietly(is);
+			try {
+				is.close();
+			} catch (IOException ex) {
+			}
 			if (connection != null) {
 				try {
 					connection.disconnect();
@@ -709,11 +738,8 @@ public class CouchdbRiver extends AbstractRiverComponent implements River {
                     }
                 }
 
-                String file = "/" + couchDb + "/_changes?feed=continuous&heartbeat=" + heartbeat.getMillis();
-                if (this.couchView == null) {
-                  file = file + "&include_docs=true";
-                }
-                
+                String file = "/" + couchDb + "/_changes?feed=continuous&heartbeat=" + heartbeat.getMillis() + "&include_docs=true";
+
                 if (couchFilter != null) {
                     try {
                         file = file + "&filter=" + URLEncoder.encode(couchFilter, "UTF-8");
